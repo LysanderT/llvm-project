@@ -85,6 +85,150 @@ raw_ostream &llvm::operator<<(raw_ostream &OS, const VPRecipeBase &R) {
 }
 #endif
 
+namespace {
+static bool isF64ScalarType(Type *Ty) { return Ty && Ty->isDoubleTy(); }
+
+static bool isF64VectorCandidate(Type *ScalarTy, ElementCount VF) {
+  return isF64ScalarType(ScalarTy) && VF.isScalable();
+}
+
+static bool isFPArithmeticOpcode(unsigned Opcode) {
+  return Opcode == Instruction::FNeg || Opcode == Instruction::FAdd ||
+         Opcode == Instruction::FSub || Opcode == Instruction::FMul ||
+         Opcode == Instruction::FDiv || Opcode == Instruction::FRem;
+}
+
+static void countF64Opcode(VCapeCandidateFacts &Facts, unsigned Opcode) {
+  switch (Opcode) {
+  case Instruction::FAdd:
+  case Instruction::FSub:
+    ++Facts.F64AddSubOps;
+    ++Facts.F64FPOps;
+    return;
+  case Instruction::FMul:
+    ++Facts.F64MulOps;
+    ++Facts.F64FPOps;
+    return;
+  case Instruction::FDiv:
+  case Instruction::FRem:
+    ++Facts.F64DivRemOps;
+    ++Facts.F64FPOps;
+    return;
+  case Instruction::FNeg:
+    ++Facts.F64OtherFPOps;
+    ++Facts.F64FPOps;
+    return;
+  default:
+    return;
+  }
+}
+
+static void countF64Intrinsic(VCapeCandidateFacts &Facts, Intrinsic::ID ID) {
+  switch (ID) {
+  case Intrinsic::fma:
+  case Intrinsic::fmuladd:
+    ++Facts.F64FusedMultiplyAdds;
+    Facts.F64FPOps += 2;
+    return;
+  case Intrinsic::sqrt:
+  case Intrinsic::sin:
+  case Intrinsic::cos:
+  case Intrinsic::exp:
+  case Intrinsic::exp2:
+  case Intrinsic::log:
+  case Intrinsic::log2:
+  case Intrinsic::log10:
+  case Intrinsic::pow:
+  case Intrinsic::powi:
+  case Intrinsic::fabs:
+  case Intrinsic::floor:
+  case Intrinsic::ceil:
+  case Intrinsic::trunc:
+  case Intrinsic::round:
+  case Intrinsic::roundeven:
+  case Intrinsic::nearbyint:
+  case Intrinsic::rint:
+    ++Facts.F64OtherFPOps;
+    ++Facts.F64FPOps;
+    return;
+  default:
+    return;
+  }
+}
+
+static VCapeCandidateFacts collectVCapeCandidateFacts(const VPlan &Plan,
+                                                      ElementCount VF) {
+  VCapeCandidateFacts Facts;
+  const VPRegionBlock *LoopRegion = Plan.getVectorLoopRegion();
+  if (!LoopRegion)
+    return Facts;
+
+  for (const VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<const VPBasicBlock>(
+           vp_depth_first_deep(LoopRegion->getEntry()))) {
+    for (const VPRecipeBase &R : *VPBB) {
+      ++Facts.Recipes;
+      if (const auto *Memory = dyn_cast<VPWidenMemoryRecipe>(&R)) {
+        ++Facts.MemoryRecipes;
+        Instruction &Ingredient = Memory->getIngredient();
+        Type *ScalarTy = nullptr;
+        if (auto *Load = dyn_cast<LoadInst>(&Ingredient))
+          ScalarTy = Load->getType();
+        else if (auto *Store = dyn_cast<StoreInst>(&Ingredient))
+          ScalarTy = Store->getValueOperand()->getType();
+
+        if (!isF64VectorCandidate(ScalarTy, VF)) {
+          ++Facts.NonF64MemoryOps;
+          continue;
+        }
+
+        if (Memory->isMasked())
+          ++Facts.MaskedMemoryOps;
+        bool IsCoveredUnitAccess =
+            Memory->isConsecutive() && !Memory->isMasked();
+        if (isa<LoadInst>(Ingredient)) {
+          if (IsCoveredUnitAccess)
+            ++Facts.F64UnitLoads;
+          else
+            ++Facts.F64OtherLoads;
+        } else if (isa<StoreInst>(Ingredient)) {
+          if (IsCoveredUnitAccess)
+            ++Facts.F64UnitStores;
+          else
+            ++Facts.F64OtherStores;
+        }
+        continue;
+      }
+
+      if (const auto *Widen = dyn_cast<VPWidenRecipe>(&R)) {
+        if (isF64VectorCandidate(Widen->getScalarType(), VF))
+          countF64Opcode(Facts, Widen->getOpcode());
+        continue;
+      }
+
+      if (const auto *Intrinsic = dyn_cast<VPWidenIntrinsicRecipe>(&R)) {
+        if (isF64VectorCandidate(Intrinsic->getScalarType(), VF))
+          countF64Intrinsic(Facts, Intrinsic->getVectorIntrinsicID());
+        continue;
+      }
+
+      if (const auto *Replicate = dyn_cast<VPReplicateRecipe>(&R)) {
+        const Instruction *Ingredient = Replicate->getUnderlyingInstr();
+        if (isa<LoadInst, StoreInst>(Ingredient))
+          ++Facts.ScalarizedMemoryOps;
+        if (Ingredient && Ingredient->getType()->isDoubleTy() &&
+            isFPArithmeticOpcode(Ingredient->getOpcode()))
+          ++Facts.ScalarizedFPOps;
+        continue;
+      }
+
+      if (isa<VPReductionRecipe, VPReductionPHIRecipe>(&R))
+        Facts.HasReduction = true;
+    }
+  }
+  return Facts;
+}
+} // namespace
+
 Value *VPLane::getAsRuntimeExpr(IRBuilderBase &Builder,
                                 const ElementCount &VF) const {
   switch (LaneKind) {
@@ -1063,6 +1207,10 @@ InstructionCost VPlan::cost(ElementCount VF, VPCostContext &Ctx) {
     return InstructionCost::getInvalid();
 
   return Cost;
+}
+
+VCapeCandidateFacts VPlan::getVCapeCandidateFacts(ElementCount VF) const {
+  return collectVCapeCandidateFacts(*this, VF);
 }
 
 VPRegionBlock *VPlan::getVectorLoopRegion() {

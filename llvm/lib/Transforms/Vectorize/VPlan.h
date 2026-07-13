@@ -4643,6 +4643,28 @@ inline const VPRegionBlock *VPRecipeBase::getRegion() const {
   return getParent()->getParent();
 }
 
+/// Candidate facts consumed by external profitability auditors. These facts
+/// describe an existing VPlan and do not change or re-enumerate the plan.
+struct VCapeCandidateFacts {
+  unsigned Recipes = 0;
+  unsigned MemoryRecipes = 0;
+  unsigned F64UnitLoads = 0;
+  unsigned F64UnitStores = 0;
+  unsigned F64OtherLoads = 0;
+  unsigned F64OtherStores = 0;
+  unsigned MaskedMemoryOps = 0;
+  unsigned NonF64MemoryOps = 0;
+  unsigned ScalarizedMemoryOps = 0;
+  unsigned F64FPOps = 0;
+  unsigned F64AddSubOps = 0;
+  unsigned F64MulOps = 0;
+  unsigned F64FusedMultiplyAdds = 0;
+  unsigned F64DivRemOps = 0;
+  unsigned F64OtherFPOps = 0;
+  unsigned ScalarizedFPOps = 0;
+  bool HasReduction = false;
+};
+
 /// VPlan models a candidate for vectorization, encoding various decisions take
 /// to produce efficient output IR, including which branches, basic-blocks and
 /// output IR instructions to generate, and their cost. VPlan holds a
@@ -4743,6 +4765,9 @@ public:
 
   /// Return the cost of this plan.
   InstructionCost cost(ElementCount VF, VPCostContext &Ctx);
+
+  /// Return structural facts for auditing the nominal profitability estimate.
+  VCapeCandidateFacts getVCapeCandidateFacts(ElementCount VF) const;
 
   VPBasicBlock *getEntry() { return Entry; }
   const VPBasicBlock *getEntry() const { return Entry; }

@@ -364,6 +364,132 @@ cl::opt<bool> llvm::VPlanPrintVectorRegionScope(
              "`-vplan-print-after*` if the plan has one."));
 #endif
 
+static cl::opt<bool> VCapeDumpSelectorCosts(
+    "vcape-dump-selector-costs", cl::Hidden, cl::init(false),
+    cl::desc("Dump nominal scalar and vector costs at final VF selection"));
+
+static cl::opt<bool> VCapeDumpCertificate(
+    "vcape-dump-certificate", cl::Hidden, cl::init(false),
+    cl::desc("Dump candidate facts and profitability audit decisions"));
+
+static cl::opt<bool> VCapeEnableCertificateDecision(
+    "vcape-enable-certificate-decision", cl::Hidden, cl::init(false),
+    cl::desc("Apply covered V-CAPE profitability certificate decisions"));
+
+static cl::opt<unsigned> VCapeDecisionMarginX1000(
+    "vcape-decision-margin-x1000", cl::Hidden, cl::init(50),
+    cl::desc("Robust V-CAPE profitability margin around break-even"));
+
+namespace {
+enum class VCapeDecision {
+  Uncovered,
+  RobustVectorize,
+  PreferScalar,
+  Uncertain,
+};
+
+struct VCapeCalibration {
+  bool Covered = false;
+  int ResidualLowerX1000 = 0;
+  int ResidualUpperX1000 = 0;
+  const char *Coverage = "none";
+  const char *Confidence = "unknown";
+  const char *Provenance = "none";
+  unsigned Samples = 0;
+};
+
+static VCapeCalibration getVCapeCalibration(StringRef TargetCPU,
+                                            ElementCount VF,
+                                            const VCapeCandidateFacts &Facts) {
+  bool HasCoveredShape =
+      VF.isScalable() && Facts.F64UnitStores == 1 &&
+      Facts.F64UnitLoads >= Facts.F64FPOps && Facts.F64FPOps != 0 &&
+      Facts.MemoryRecipes == Facts.F64UnitLoads + Facts.F64UnitStores &&
+      Facts.F64OtherLoads == 0 && Facts.F64OtherStores == 0 &&
+      Facts.MaskedMemoryOps == 0 && Facts.NonF64MemoryOps == 0 &&
+      Facts.ScalarizedMemoryOps == 0 && Facts.ScalarizedFPOps == 0 &&
+      Facts.F64DivRemOps == 0 && Facts.F64OtherFPOps == 0 &&
+      Facts.F64FPOps == Facts.F64AddSubOps + Facts.F64MulOps +
+                            2 * Facts.F64FusedMultiplyAdds &&
+      !Facts.HasReduction;
+  if (!HasCoveredShape)
+    return {};
+
+  unsigned LMUL = VF.getKnownMinValue();
+  if (LMUL != 1 && LMUL != 2)
+    return {};
+
+  // Signed residual envelopes are derived from target-matched scalar/RVV
+  // pairs across aligned and skewed 64-byte-aligned stream placements. Each
+  // cell contains three pairs per placement (six samples total), and bounds
+  // include the placement envelope and per-placement 95% confidence interval.
+  auto Result = [](int Lower, int Upper, const char *Coverage) {
+    return VCapeCalibration{
+        true, Lower, Upper, Coverage, "medium", "placement-v2-20260713", 6};
+  };
+
+  if (TargetCPU == "spacemit-x100") {
+    switch (Facts.F64UnitLoads) {
+    case 8:
+      return LMUL == 1 ? Result(508, 689, "x100-e64-unit-load-v2")
+                       : Result(485, 837, "x100-e64-unit-load-v2");
+    case 10:
+      return LMUL == 1 ? Result(1606, 2413, "x100-e64-unit-load-v2")
+                       : Result(1330, 2510, "x100-e64-unit-load-v2");
+    case 14:
+      return LMUL == 1 ? Result(1150, 2330, "x100-e64-unit-load-v2")
+                       : Result(1122, 2519, "x100-e64-unit-load-v2");
+    default:
+      return {};
+    }
+  }
+
+  if (TargetCPU == "spacemit-a100") {
+    switch (Facts.F64UnitLoads) {
+    case 8:
+      return LMUL == 1 ? Result(88, 626, "a100-e64-unit-load-v2")
+                       : Result(-10, 110, "a100-e64-unit-load-v2");
+    case 10:
+      return LMUL == 1 ? Result(-3, 240, "a100-e64-unit-load-v2")
+                       : Result(-56, 104, "a100-e64-unit-load-v2");
+    case 14:
+      return LMUL == 1 ? Result(124, 3326, "a100-e64-unit-load-v2")
+                       : Result(-107, 100, "a100-e64-unit-load-v2");
+    default:
+      return {};
+    }
+  }
+  return {};
+}
+
+static VCapeDecision classifyVCapeCandidate(const VCapeCalibration &Calibration,
+                                            int64_t PredictedLowerX1000,
+                                            int64_t PredictedUpperX1000) {
+  if (!Calibration.Covered)
+    return VCapeDecision::Uncovered;
+  int64_t Margin = VCapeDecisionMarginX1000;
+  if (PredictedUpperX1000 < 1000 - Margin)
+    return VCapeDecision::RobustVectorize;
+  if (PredictedLowerX1000 > 1000 + Margin)
+    return VCapeDecision::PreferScalar;
+  return VCapeDecision::Uncertain;
+}
+
+static StringRef getVCapeDecisionName(VCapeDecision Decision) {
+  switch (Decision) {
+  case VCapeDecision::Uncovered:
+    return "uncovered";
+  case VCapeDecision::RobustVectorize:
+    return "robust-vectorize";
+  case VCapeDecision::PreferScalar:
+    return "prefer-scalar";
+  case VCapeDecision::Uncertain:
+    return "uncertain";
+  }
+  llvm_unreachable("unknown V-CAPE decision");
+}
+} // namespace
+
 // This flag enables the stress testing of the VPlan H-CFG construction in the
 // VPlan-native vectorization path. It must be used in conjuction with
 // -enable-vplan-native-path. -vplan-verify-hcfg can also be used to enable the
@@ -6101,13 +6227,118 @@ LoopVectorizationPlanner::computeBestVF() {
           cost(*P, VF, ConsiderRegPressure ? &RUs[I] : nullptr);
       VectorizationFactor CurrentFactor(VF, Cost, ScalarCost);
 
-      if (isMoreProfitable(CurrentFactor, BestFactor, P->hasScalarTail())) {
+      bool RunVCape = VCapeDumpCertificate || VCapeDumpSelectorCosts ||
+                      VCapeEnableCertificateDecision;
+      VCapeCandidateFacts VCapeFacts;
+      StringRef TargetCPU;
+      if (RunVCape) {
+        VCapeFacts = P->getVCapeCandidateFacts(VF);
+        Attribute TargetCPUAttr =
+            OrigLoop->getHeader()->getParent()->getFnAttribute("target-cpu");
+        if (TargetCPUAttr.isStringAttribute())
+          TargetCPU = TargetCPUAttr.getValueAsString();
+      }
+      unsigned EstimatedWidth = 0;
+      int64_t NominalRatioX1000 = 0;
+      if (RunVCape)
+        EstimatedWidth = estimateElementCount(VF, Config.getVScaleForTuning());
+      if (RunVCape && Cost.isValid() && ScalarCost.isValid() &&
+          ScalarCost.getValue() > 0)
+        NominalRatioX1000 =
+            static_cast<uint64_t>(Cost.getValue()) * 1000 /
+            (EstimatedWidth * static_cast<uint64_t>(ScalarCost.getValue()));
+      VCapeCalibration Calibration;
+      if (RunVCape)
+        Calibration = getVCapeCalibration(TargetCPU, VF, VCapeFacts);
+      int64_t PredictedRatioLowerX1000 = std::max<int64_t>(
+          0, NominalRatioX1000 + Calibration.ResidualLowerX1000);
+      int64_t PredictedRatioUpperX1000 = std::max<int64_t>(
+          0, NominalRatioX1000 + Calibration.ResidualUpperX1000);
+      VCapeDecision Decision = classifyVCapeCandidate(
+          Calibration, PredictedRatioLowerX1000, PredictedRatioUpperX1000);
+      bool ApplyVCapeDecision =
+          VCapeEnableCertificateDecision && !ForceVectorization;
+
+      bool MoreProfitableThanBest =
+          isMoreProfitable(CurrentFactor, BestFactor, P->hasScalarTail());
+      bool MoreProfitableThanScalar =
+          isMoreProfitable(CurrentFactor, ScalarFactor, P->hasScalarTail());
+      StringRef VCapeAction = "observe";
+      if (ApplyVCapeDecision) {
+        switch (Decision) {
+        case VCapeDecision::PreferScalar:
+          MoreProfitableThanBest = false;
+          MoreProfitableThanScalar = false;
+          VCapeAction = "reject";
+          break;
+        case VCapeDecision::RobustVectorize:
+          MoreProfitableThanBest =
+              BestFactor.Width.isScalar() || MoreProfitableThanBest;
+          MoreProfitableThanScalar = true;
+          VCapeAction = "accept";
+          break;
+        case VCapeDecision::Uncertain:
+        case VCapeDecision::Uncovered:
+          VCapeAction = "preserve";
+          break;
+        }
+      }
+
+      if (VCapeDumpCertificate)
+        errs() << "V-CAPE-CERTIFICATE: function="
+               << OrigLoop->getHeader()->getParent()->getName()
+               << " target=" << TargetCPU << " vf=" << VF << " sew="
+               << ((VCapeFacts.F64UnitLoads || VCapeFacts.F64UnitStores ||
+                    VCapeFacts.F64OtherLoads || VCapeFacts.F64OtherStores ||
+                    VCapeFacts.F64FPOps)
+                       ? 64
+                       : 0)
+               << " estimated_lmul="
+               << (VF.isScalable() ? VF.getKnownMinValue() : 0)
+               << " f64_unit_loads=" << VCapeFacts.F64UnitLoads
+               << " f64_unit_stores=" << VCapeFacts.F64UnitStores
+               << " f64_other_loads=" << VCapeFacts.F64OtherLoads
+               << " f64_other_stores=" << VCapeFacts.F64OtherStores
+               << " masked_memory_ops=" << VCapeFacts.MaskedMemoryOps
+               << " non_f64_memory_ops=" << VCapeFacts.NonF64MemoryOps
+               << " scalarized_memory_ops=" << VCapeFacts.ScalarizedMemoryOps
+               << " f64_fp_ops=" << VCapeFacts.F64FPOps
+               << " f64_addsub_ops=" << VCapeFacts.F64AddSubOps
+               << " f64_mul_ops=" << VCapeFacts.F64MulOps
+               << " f64_fma_ops=" << VCapeFacts.F64FusedMultiplyAdds
+               << " f64_divrem_ops=" << VCapeFacts.F64DivRemOps
+               << " f64_other_fp_ops=" << VCapeFacts.F64OtherFPOps
+               << " scalarized_fp_ops=" << VCapeFacts.ScalarizedFPOps
+               << " has_reduction=" << VCapeFacts.HasReduction
+               << " has_scalar_tail=" << P->hasScalarTail()
+               << " nominal_ratio_x1000=" << NominalRatioX1000
+               << " coverage=" << Calibration.Coverage
+               << " confidence=" << Calibration.Confidence
+               << " provenance=" << Calibration.Provenance
+               << " samples=" << Calibration.Samples
+               << " residual_lower_x1000=" << Calibration.ResidualLowerX1000
+               << " residual_upper_x1000=" << Calibration.ResidualUpperX1000
+               << " predicted_ratio_lower_x1000=" << PredictedRatioLowerX1000
+               << " predicted_ratio_upper_x1000=" << PredictedRatioUpperX1000
+               << " decision=" << getVCapeDecisionName(Decision)
+               << " action=" << VCapeAction << "\n";
+
+      if (VCapeDumpSelectorCosts)
+        errs() << "V-CAPE-SELECTOR: function="
+               << OrigLoop->getHeader()->getParent()->getName() << " vf=" << VF
+               << " scalar_cost=" << ScalarCost << " vector_cost=" << Cost
+               << " estimated_width=" << EstimatedWidth
+               << " certificate_decision=" << getVCapeDecisionName(Decision)
+               << " decision_applied=" << ApplyVCapeDecision
+               << " profitable_vs_scalar=" << MoreProfitableThanScalar << "\n";
+
+      if (MoreProfitableThanBest) {
         BestFactor = CurrentFactor;
         PlanForBestVF = P.get();
       }
 
       // If profitable add it to ProfitableVF list.
-      if (isMoreProfitable(CurrentFactor, ScalarFactor, P->hasScalarTail()))
+      if (MoreProfitableThanScalar)
         ProfitableVFs.push_back(CurrentFactor);
     }
   }
